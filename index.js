@@ -1,9 +1,35 @@
 const express = require('express');
+const axios = require('axios');
 const app = express();
 
 app.use(express.json());
 
 let messages = [];
+
+// ========================================
+// Configuração de Encaminhamento
+// ========================================
+const SPRING_BOOT_URL = process.env.SPRING_BOOT_URL || 'http://localhost:8080/api/webhook/evolution';
+const FORWARD_ENABLED = process.env.FORWARD_ENABLED !== 'false';
+const FORWARD_TIMEOUT = parseInt(process.env.FORWARD_TIMEOUT) || 5000;
+const RETRY_ATTEMPTS = parseInt(process.env.FORWARD_RETRY_ATTEMPTS) || 3;
+const RETRY_DELAY_BASE = 1000; // 1 segundo base para exponential backoff
+
+// Estatísticas de encaminhamento
+let forwardStats = {
+    total: 0,
+    success: 0,
+    failed: 0,
+    lastSuccess: null,
+    lastFailure: null,
+    lastError: null
+};
+
+console.log('🔧 Configuração de Encaminhamento:');
+console.log(`  URL Spring Boot: ${SPRING_BOOT_URL}`);
+console.log(`  Encaminhamento: ${FORWARD_ENABLED ? 'HABILITADO' : 'DESABILITADO'}`);
+console.log(`  Timeout: ${FORWARD_TIMEOUT}ms`);
+console.log(`  Tentativas de Retry: ${RETRY_ATTEMPTS}`);
 
 // Função para formatar telefone
 function formatPhone(jid) {
@@ -26,6 +52,70 @@ function getEventLabel(event) {
         'contacts.update': '👤 Contato Atualizado'
     };
     return labels[event] || `📋 ${event}`;
+}
+
+// ========================================
+// Função de Encaminhamento com Retry
+// ========================================
+async function forwardToSpringBoot(eventData, attempt = 1) {
+    forwardStats.total++;
+
+    const timestamp = new Date().toISOString();
+    const eventType = eventData.event || 'unknown';
+
+    console.log(`\n🚀 [${timestamp}] Encaminhando evento para Spring Boot (Tentativa ${attempt}/${RETRY_ATTEMPTS})`);
+    console.log(`   Evento: ${eventType}`);
+    console.log(`   URL: ${SPRING_BOOT_URL}`);
+
+    try {
+        const response = await axios.post(SPRING_BOOT_URL, eventData, {
+            timeout: FORWARD_TIMEOUT,
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Webhook-Monitor/1.0'
+            }
+        });
+
+        forwardStats.success++;
+        forwardStats.lastSuccess = timestamp;
+
+        console.log(`✅ [${timestamp}] Encaminhamento bem-sucedido!`);
+        console.log(`   Status: ${response.status}`);
+        console.log(`   Taxa de sucesso: ${((forwardStats.success / forwardStats.total) * 100).toFixed(2)}%`);
+
+        return { success: true, attempt };
+
+    } catch (error) {
+        const errorMessage = error.response
+            ? `HTTP ${error.response.status}: ${error.response.statusText}`
+            : error.code === 'ECONNREFUSED'
+            ? 'Conexão recusada - Spring Boot pode estar offline'
+            : error.code === 'ETIMEDOUT'
+            ? 'Timeout - Spring Boot não respondeu a tempo'
+            : error.message;
+
+        console.error(`❌ [${timestamp}] Falha no encaminhamento (Tentativa ${attempt}/${RETRY_ATTEMPTS})`);
+        console.error(`   Erro: ${errorMessage}`);
+
+        // Retry com exponential backoff
+        if (attempt < RETRY_ATTEMPTS) {
+            const delayMs = RETRY_DELAY_BASE * Math.pow(2, attempt - 1);
+            console.log(`⏳ Aguardando ${delayMs}ms antes de tentar novamente...`);
+
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+            return forwardToSpringBoot(eventData, attempt + 1);
+        }
+
+        // Todas as tentativas falharam
+        forwardStats.failed++;
+        forwardStats.lastFailure = timestamp;
+        forwardStats.lastError = errorMessage;
+
+        console.error(`💥 [${timestamp}] Todas as tentativas de encaminhamento falharam!`);
+        console.error(`   Taxa de falha: ${((forwardStats.failed / forwardStats.total) * 100).toFixed(2)}%`);
+
+        return { success: false, error: errorMessage, attempts: attempt };
+    }
 }
 
 app.get('/', (req, res) => {
@@ -373,10 +463,11 @@ app.get('/', (req, res) => {
   `);
 });
 
-app.post('/webhook', (req, res) => {
+app.post('/webhook', async (req, res) => {
     console.log('📱 Evento:', req.body.event);
     console.log('📦 Dados:', JSON.stringify(req.body, null, 2));
 
+    // Armazenamento local (existente)
     messages.unshift({
         ...req.body,
         receivedAt: new Date().toISOString()
@@ -386,6 +477,17 @@ app.post('/webhook', (req, res) => {
         messages = messages.slice(0, 100);
     }
 
+    // Encaminhar para Spring Boot em background (não bloqueia resposta)
+    if (FORWARD_ENABLED) {
+        // Executar em background sem bloquear
+        forwardToSpringBoot(req.body).catch(error => {
+            console.error('Erro crítico no encaminhamento:', error.message);
+        });
+    } else {
+        console.log('⚠️  Encaminhamento desabilitado via configuração');
+    }
+
+    // Responde imediatamente ao Evolution API
     res.json({ success: true });
 });
 
@@ -396,6 +498,74 @@ app.post('/api/clear', (req, res) => {
 
 app.get('/api/messages', (req, res) => {
     res.json(messages);
+});
+
+// ========================================
+// Endpoint de Estatísticas de Encaminhamento
+// ========================================
+app.get('/api/forward-stats', (req, res) => {
+    const successRate = forwardStats.total > 0
+        ? ((forwardStats.success / forwardStats.total) * 100).toFixed(2)
+        : 0;
+
+    const failureRate = forwardStats.total > 0
+        ? ((forwardStats.failed / forwardStats.total) * 100).toFixed(2)
+        : 0;
+
+    res.json({
+        enabled: FORWARD_ENABLED,
+        springBootUrl: SPRING_BOOT_URL,
+        timeout: FORWARD_TIMEOUT,
+        retryAttempts: RETRY_ATTEMPTS,
+        stats: {
+            ...forwardStats,
+            successRate: `${successRate}%`,
+            failureRate: `${failureRate}%`
+        }
+    });
+});
+
+// ========================================
+// Endpoint de Health Check Spring Boot
+// ========================================
+app.get('/api/health', async (req, res) => {
+    const checkSpringBoot = async () => {
+        try {
+            const healthUrl = SPRING_BOOT_URL.replace('/webhook/evolution', '/webhook/health');
+            const response = await axios.get(healthUrl, { timeout: 3000 });
+            return {
+                status: 'UP',
+                springBoot: {
+                    reachable: true,
+                    status: response.status,
+                    url: healthUrl
+                }
+            };
+        } catch (error) {
+            return {
+                status: 'DOWN',
+                springBoot: {
+                    reachable: false,
+                    error: error.code === 'ECONNREFUSED'
+                        ? 'Spring Boot offline'
+                        : error.message,
+                    url: SPRING_BOOT_URL
+                }
+            };
+        }
+    };
+
+    const health = await checkSpringBoot();
+    const httpStatus = health.status === 'UP' ? 200 : 503;
+
+    res.status(httpStatus).json({
+        monitor: {
+            status: 'UP',
+            forwardingEnabled: FORWARD_ENABLED,
+            messagesStored: messages.length
+        },
+        ...health
+    });
 });
 
 const PORT = process.env.PORT || 3000;
